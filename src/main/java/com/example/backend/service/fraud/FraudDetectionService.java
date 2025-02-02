@@ -1,6 +1,7 @@
 package com.example.backend.service.fraud;
 
 import com.example.backend.model.Purchase;
+import com.example.backend.model.HistoricalAnalysis;
 
 import org.apache.ignite.Ignite;
 import org.apache.ignite.IgniteCache;
@@ -11,6 +12,7 @@ import weka.core.Instances;
 import weka.core.Attribute;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
 import jakarta.annotation.PostConstruct;
@@ -19,19 +21,20 @@ import jakarta.annotation.PostConstruct;
 public class FraudDetectionService {
     private RandomForest classifier;
     private Instances dataStructure;
+    final TransactionHistoryAnalyzer historyAnalyzer;
 
     @PostConstruct
     public void init() {
         try {
             // Initialize ML model
             classifier = new RandomForest();
-            
+
             // Define attributes for the model
             ArrayList<Attribute> attributes = new ArrayList<>();
             attributes.add(new Attribute("amount"));
             attributes.add(new Attribute("hour_of_day"));
             attributes.add(new Attribute("transaction_frequency"));
-            
+
             ArrayList<String> classValues = new ArrayList<>();
             classValues.add("legitimate");
             classValues.add("fraudulent");
@@ -41,10 +44,10 @@ public class FraudDetectionService {
             // Create dataset with attributes
             dataStructure = new Instances("FraudDetection", attributes, 0);
             dataStructure.setClassIndex(dataStructure.numAttributes() - 1);
-            
+
             // Add some initial training data
             addTrainingData();
-            
+
             // Train the model
             trainModel();
         } catch (Exception e) {
@@ -54,14 +57,14 @@ public class FraudDetectionService {
 
     private void addTrainingData() {
         // Add legitimate transactions
-        addInstance(100.0, 14, 0.1, false);  // Normal daytime purchase
-        addInstance(50.0, 12, 0.2, false);   // Small daytime purchase
-        addInstance(200.0, 15, 0.3, false);  // Medium daytime purchase
-        
+        addInstance(100.0, 14, 0.1, false); // Normal daytime purchase
+        addInstance(50.0, 12, 0.2, false); // Small daytime purchase
+        addInstance(200.0, 15, 0.3, false); // Medium daytime purchase
+
         // Add fraudulent transactions
-        addInstance(999.9, 3, 0.9, true);    // Large nighttime purchase with high frequency
-        addInstance(888.8, 2, 0.8, true);    // Large nighttime purchase
-        addInstance(777.7, 1, 0.7, true);    // Large nighttime purchase
+        addInstance(999.9, 3, 0.9, true); // Large nighttime purchase with high frequency
+        addInstance(888.8, 2, 0.8, true); // Large nighttime purchase
+        addInstance(777.7, 1, 0.7, true); // Large nighttime purchase
     }
 
     private void addInstance(double amount, int hour, double frequency, boolean isFraud) {
@@ -70,7 +73,7 @@ public class FraudDetectionService {
         values[1] = normalizeHour(LocalTime.of(hour, 0));
         values[2] = frequency;
         values[3] = isFraud ? 1.0 : 0.0;
-        
+
         dataStructure.add(new DenseInstance(1.0, values));
     }
 
@@ -80,70 +83,53 @@ public class FraudDetectionService {
     private static final int SUSPICIOUS_HOUR_END = 5;
     private final IgniteCache<Long, List<Purchase>> userTransactionCache;
 
-    public FraudDetectionService(Ignite ignite) {
+    public FraudDetectionService(Ignite ignite, TransactionHistoryAnalyzer historyAnalyzer) {
         this.userTransactionCache = ignite.getOrCreateCache("userTransactionCache");
+        this.historyAnalyzer = historyAnalyzer;
     }
 
     public boolean analyzeTransaction(Purchase purchase) {
         try {
-            // Basic ML prediction
+            // Get historical analysis
+            HistoricalAnalysis history = historyAnalyzer.analyzeUserHistory(purchase);
+
+            // Add historical features to ML model
             double[] values = new double[dataStructure.numAttributes()];
             values[0] = normalizeAmount(purchase.getAmount());
             values[1] = normalizeHour(LocalTime.from(purchase.getTimestamp()));
-            values[2] = calculateTransactionFrequency(purchase);
+            values[2] = history.getPurchaseFrequencyScore();
+            values[3] = history.getUnusualPatternScore();
 
             DenseInstance instance = new DenseInstance(1.0, values);
             instance.setDataset(dataStructure);
-            
+
             double mlPrediction = classifier.classifyInstance(instance);
-            
-            // Enhanced fraud detection rules
-            boolean isSuspicious = isTransactionSuspicious(purchase);
-            boolean hasUnusualPattern = checkUnusualPattern(purchase);
+
+            // Enhanced fraud detection with historical data
+            boolean isSuspicious = isTransactionSuspicious(purchase, history);
+            boolean hasUnusualPattern = history.getUnusualPatternScore() > 0.7;
             boolean isLocationSuspicious = isLocationSuspicious(purchase);
-            
-            // Combine all signals for final decision
-            return mlPrediction == 1.0 || 
-                   (isSuspicious && (hasUnusualPattern || isLocationSuspicious));
-            
+
+            return mlPrediction == 1.0 ||
+                    (isSuspicious && (hasUnusualPattern || isLocationSuspicious));
+
         } catch (Exception e) {
             return handleAnalysisError(purchase, e);
         }
     }
 
-    private boolean isTransactionSuspicious(Purchase purchase) {
-        // Check amount threshold
-        if (purchase.getAmount() > SUSPICIOUS_AMOUNT_THRESHOLD) {
+    private boolean isTransactionSuspicious(Purchase purchase, HistoricalAnalysis history) {
+        if (purchase.getAmount() > history.getAverageAmount() + (3 * history.getStandardDeviation())) {
             return true;
         }
 
-        // Check suspicious hours
         int hour = purchase.getTimestamp().getHour();
-        if (hour >= SUSPICIOUS_HOUR_START || hour <= SUSPICIOUS_HOUR_END) {
+        Map<Integer, Integer> typicalHours = history.getTypicalPurchaseHours();
+        if (!typicalHours.containsKey(hour) || typicalHours.get(hour) < 2) {
             return true;
         }
 
         return false;
-    }
-
-    private boolean checkUnusualPattern(Purchase purchase) {
-        List<Purchase> userHistory = getUserTransactionHistory(purchase.getUserId());
-        if (userHistory == null || userHistory.isEmpty()) {
-            return false;
-        }
-
-        // Check for sudden frequency increase
-        long recentTransactions = userHistory.stream()
-            .filter(p -> p.getTimestamp().isAfter(purchase.getTimestamp().minusHours(1)))
-            .count();
-        
-        // Check for amount pattern deviation
-        double avgAmount = userHistory.stream()
-            .mapToDouble(Purchase::getAmount)
-            .average()
-            .orElse(0.0);
-        
-        return recentTransactions > 3 || purchase.getAmount() > avgAmount * 3;
     }
 
     private boolean isLocationSuspicious(Purchase purchase) {
@@ -154,14 +140,14 @@ public class FraudDetectionService {
 
         // Get user's last transaction location
         Purchase lastTransaction = userHistory.get(userHistory.size() - 1);
-        
+
         // Check if location changed too quickly (impossible travel)
-        if (lastTransaction != null && 
-            lastTransaction.getTimestamp().plusHours(2).isAfter(purchase.getTimestamp())) {
+        if (lastTransaction != null &&
+                lastTransaction.getTimestamp().plusHours(2).isAfter(purchase.getTimestamp())) {
             // Simple distance check (should be replaced with actual geo calculation)
             return !lastTransaction.getMerchantName().equals(purchase.getMerchantName());
         }
-        
+
         return false;
     }
 
@@ -184,13 +170,6 @@ public class FraudDetectionService {
     private double normalizeHour(LocalTime time) {
         // Convert hour to value between 0 and 1
         return time.getHour() / 24.0;
-    }
-
-    private double calculateTransactionFrequency(Purchase purchase) {
-        // Count transactions in last hour from same user
-        LocalTime oneHourAgo = LocalTime.from(purchase.getTimestamp()).minus(1, ChronoUnit.HOURS);
-        // In production, this would query a time-series database
-        return 0.5; // Placeholder value
     }
 
     private void trainModel() {
