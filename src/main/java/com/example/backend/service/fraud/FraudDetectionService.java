@@ -14,9 +14,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.time.LocalTime;
-import java.time.temporal.ChronoUnit;
 import jakarta.annotation.PostConstruct;
 
+/**
+ * The FraudDetectionService class is responsible for analyzing transactions to detect potential fraud.
+ * It uses a combination of machine learning and historical analysis to determine if a transaction is suspicious.
+ */
 @Service
 public class FraudDetectionService {
     private RandomForest classifier;
@@ -83,11 +86,23 @@ public class FraudDetectionService {
     private static final int SUSPICIOUS_HOUR_END = 5;
     private final IgniteCache<Long, List<Purchase>> userTransactionCache;
 
+    /**
+     * Initializes the FraudDetectionService with the given Ignite instance and TransactionHistoryAnalyzer.
+     *
+     * @param ignite          An instance of Ignite used to initialize the caches.
+     * @param historyAnalyzer An instance of TransactionHistoryAnalyzer used for historical analysis.
+     */
     public FraudDetectionService(Ignite ignite, TransactionHistoryAnalyzer historyAnalyzer) {
         this.userTransactionCache = ignite.getOrCreateCache("userTransactionCache");
         this.historyAnalyzer = historyAnalyzer;
     }
 
+    /**
+     * Analyzes the given transaction to determine if it is fraudulent.
+     *
+     * @param purchase An instance of Purchase representing the transaction to be analyzed.
+     * @return A boolean indicating whether the transaction is fraudulent.
+     */
     public boolean analyzeTransaction(Purchase purchase) {
         try {
             // Get historical analysis
@@ -109,6 +124,9 @@ public class FraudDetectionService {
             boolean isSuspicious = isTransactionSuspicious(purchase, history);
             boolean hasUnusualPattern = history.getUnusualPatternScore() > 0.7;
             boolean isLocationSuspicious = isLocationSuspicious(purchase);
+
+            // Return true if the machine learning model predicts the transaction as fraudulent (mlPrediction == 1.0)
+            // OR if the transaction is suspicious based on historical analysis and either has unusual patterns or is in a suspicious location
 
             return mlPrediction == 1.0 ||
                     (isSuspicious && (hasUnusualPattern || isLocationSuspicious));
